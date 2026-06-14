@@ -10,7 +10,7 @@ ARG BUILD_VERSION=dev
 
 WORKDIR /frontend
 COPY frontend/package.json frontend/package-lock.json ./
-RUN --mount=type=cache,target=/root/.npm \
+RUN --mount=type=cache,id=cacheKey-npm-cache,target=/root/.npm \
     npm ci --no-audit --no-fund
 COPY frontend/ .
 RUN VITE_APP_VERSION=${BUILD_VERSION} npm run build
@@ -25,7 +25,7 @@ ARG TARGETARCH
 
 WORKDIR /app
 COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod \
+RUN --mount=type=cache,id=go-mod-cache,target=/go/pkg/mod \
     go mod download
 
 COPY . .
