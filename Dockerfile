@@ -31,8 +31,8 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 COPY . .
 COPY --from=frontend-builder /frontend/dist ./frontend/dist
 
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
+RUN --mount=type=cache,id=npm-cache,target=/root/.npm
+    --mount=type=cache,id=go-mod-cache,target=/go/pkg/mod
     CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -ldflags="-s -w" -o /codex2api .
 
 # ============================================================
