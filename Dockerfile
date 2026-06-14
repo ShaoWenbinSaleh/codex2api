@@ -10,8 +10,7 @@ ARG BUILD_VERSION=dev
 
 WORKDIR /frontend
 COPY frontend/package.json frontend/package-lock.json ./
-RUN --mount=type=cache,id=cacheKey-npm-cache,target=/root/.npm \
-    npm ci --no-audit --no-fund
+RUN npm ci --no-audit --no-fund
 COPY frontend/ .
 RUN VITE_APP_VERSION=${BUILD_VERSION} npm run build
 
@@ -25,15 +24,13 @@ ARG TARGETARCH
 
 WORKDIR /app
 COPY go.mod go.sum ./
-RUN --mount=type=cache,id=go-mod-cache,target=/go/pkg/mod \
-    go mod download
+RUN go mod download
 
 COPY . .
 COPY --from=frontend-builder /frontend/dist ./frontend/dist
 
-RUN --mount=type=cache,id=npm-cache,target=/root/.npm
-    --mount=type=cache,id=go-mod-cache,target=/go/pkg/mod
-    CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -ldflags="-s -w" -o /codex2api .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
+    go build -ldflags="-s -w" -o /codex2api .
 
 # ============================================================
 # Stage 3: 最终运行镜像
