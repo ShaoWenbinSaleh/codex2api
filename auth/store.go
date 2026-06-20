@@ -4936,6 +4936,44 @@ func (s *Store) UpdateAccountPlanType(acc *Account, planType string) bool {
 	return changed
 }
 
+// UpdateAccountIdentity persists account identity observed from upstream usage APIs.
+func (s *Store) UpdateAccountIdentity(acc *Account, email, accountID string) bool {
+	if s == nil || acc == nil {
+		return false
+	}
+	email = strings.TrimSpace(email)
+	accountID = strings.TrimSpace(accountID)
+	if email == "" && accountID == "" {
+		return false
+	}
+
+	fields := make(map[string]interface{}, 2)
+	acc.mu.Lock()
+	changed := false
+	if email != "" && acc.Email != email {
+		acc.Email = email
+		fields["email"] = email
+		changed = true
+	}
+	if accountID != "" && acc.AccountID != accountID {
+		acc.AccountID = accountID
+		fields["account_id"] = accountID
+		changed = true
+	}
+	acc.mu.Unlock()
+
+	if s.db == nil || len(fields) == 0 {
+		return changed
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.db.UpdateCredentials(ctx, acc.DBID, fields); err != nil {
+		log.Printf("[账号 %d] 持久化账号身份失败: %v", acc.DBID, err)
+	}
+	return changed
+}
+
 // ApplyUsageLimitMetadata applies metadata returned by Codex usage_limit_reached errors.
 func (s *Store) ApplyUsageLimitMetadata(acc *Account, planType string, resetAt time.Time) {
 	if acc == nil {

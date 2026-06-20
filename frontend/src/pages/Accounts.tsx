@@ -252,6 +252,10 @@ function formatAccountListEmail(account: AccountRow): string {
   return account.email?.trim() || account.name || `ID ${account.id}`;
 }
 
+function formatAccessTokenBadge(account: AccountRow): string {
+  return account.access_token_type === "codex_at" ? "codex_at" : "AT";
+}
+
 function getInitialAnalysisVisibility(): boolean {
   try {
     return (
@@ -3927,7 +3931,7 @@ export default function Accounts() {
                                     <div className="flex flex-wrap gap-1">
                                       {account.at_only && (
                                         <span className="inline-flex items-center rounded-md bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-inset ring-amber-600/20 dark:bg-amber-950 dark:text-amber-400 dark:ring-amber-400/20">
-                                          AT
+                                          {formatAccessTokenBadge(account)}
                                         </span>
                                       )}
                                       {account.openai_responses_api && (
@@ -8364,7 +8368,7 @@ function AccountMobileCard({
               <div className="mt-3 flex min-h-6 min-w-0 flex-wrap items-center gap-1.5">
                 {account.at_only && (
                   <span className="inline-flex items-center rounded-md bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-inset ring-amber-600/20 dark:bg-amber-950 dark:text-amber-400 dark:ring-amber-400/20">
-                    AT
+                    {formatAccessTokenBadge(account)}
                   </span>
                 )}
                 {account.openai_responses_api && (
@@ -8690,7 +8694,7 @@ function AccountMobileCard({
           <div className="mt-2 flex min-h-6 min-w-0 flex-wrap items-center gap-1.5">
             {account.at_only && (
               <span className="inline-flex items-center rounded-md bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-inset ring-amber-600/20 dark:bg-amber-950 dark:text-amber-400 dark:ring-amber-400/20">
-                AT
+                {formatAccessTokenBadge(account)}
               </span>
             )}
             {account.openai_responses_api && (

@@ -34,6 +34,7 @@ export interface AccountRow {
   status: AccountStatus
   error_message?: string
   at_only?: boolean
+  access_token_type?: string
   account_type?: string
   openai_responses_api?: boolean
   base_url?: string
@@ -154,6 +155,7 @@ export interface RecycleBinAccountRow {
   email: string
   plan_type: string
   at_only?: boolean
+  access_token_type?: string
   openai_responses_api?: boolean
   base_url?: string
   models?: string[]

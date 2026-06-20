@@ -567,6 +567,7 @@ type accountResponse struct {
 	CreditSkipUsageWindow    bool                       `json:"credit_skip_usage_window"`
 	SkipWarmTier             bool                       `json:"skip_warm_tier"`
 	AccountType              string                     `json:"account_type,omitempty"`
+	AccessTokenType          string                     `json:"access_token_type,omitempty"`
 	OpenAIResponsesAPI       bool                       `json:"openai_responses_api,omitempty"`
 	BaseURL                  string                     `json:"base_url,omitempty"`
 	Models                   []string                   `json:"models,omitempty"`
@@ -653,6 +654,16 @@ func accountEmailDomain(email string) string {
 	return domain
 }
 
+func accountAccessTokenType(row *database.AccountRow) string {
+	if row == nil {
+		return ""
+	}
+	if tokenType := strings.TrimSpace(row.GetCredential("access_token_type")); tokenType != "" {
+		return tokenType
+	}
+	return accessTokenTypeForToken(row.GetCredential("access_token"))
+}
+
 type schedulerBreakdownResponse struct {
 	UnauthorizedPenalty float64 `json:"unauthorized_penalty"`
 	RateLimitPenalty    float64 `json:"rate_limit_penalty"`
@@ -719,6 +730,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			CreditSkipUsageWindow:    row.CreditSkipUsageWindow,
 			SkipWarmTier:             row.SkipWarmTier,
 			AccountType:              row.Type,
+			AccessTokenType:          accountAccessTokenType(row),
 			OpenAIResponsesAPI:       isOpenAIResponsesAccount,
 			BaseURL:                  baseURL,
 			Models:                   row.GetCredentialStringSlice("models"),
@@ -1812,40 +1824,13 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 		successCount++
 		h.db.InsertAccountEventAsync(id, "added", "manual_at")
 
-		// 解析 AT JWT 提取账号信息（email、plan_type、account_id、过期时间）
-		atInfo := auth.ParseAccessToken(at)
-
-		// 热加载到内存池（AT-only，无 RT）
-		newAcc := &auth.Account{
-			DBID:        id,
-			AccessToken: at,
-			ExpiresAt:   time.Now().Add(1 * time.Hour),
-			ProxyURL:    req.ProxyURL,
-		}
-		if atInfo != nil {
-			newAcc.Email = atInfo.Email
-			newAcc.AccountID = atInfo.ChatGPTAccountID
-			newAcc.PlanType = atInfo.PlanType
-			if !atInfo.ExpiresAt.IsZero() {
-				newAcc.ExpiresAt = atInfo.ExpiresAt
-			}
-			if !atInfo.SubscriptionExpiresAt.IsZero() {
-				newAcc.SubscriptionExpiresAt = atInfo.SubscriptionExpiresAt
-			}
-		}
+		// 热加载到内存池（AT-only，无 RT）。codex_at 不走 JWT 解码，
+		// 身份信息后续由 wham 用量查询补齐。
+		newAcc := accountFromCredentialSeed(id, req.ProxyURL, seed)
 		h.store.AddAccount(newAcc)
 
-		// 将解析到的信息持久化到数据库
-		if atInfo != nil {
-			creds := map[string]interface{}{
-				"email":      atInfo.Email,
-				"account_id": atInfo.ChatGPTAccountID,
-				"plan_type":  atInfo.PlanType,
-				"expires_at": newAcc.ExpiresAt.Format(time.RFC3339),
-			}
-			if !atInfo.SubscriptionExpiresAt.IsZero() {
-				creds["subscription_expires_at"] = atInfo.SubscriptionExpiresAt.Format(time.RFC3339)
-			}
+		// 将解析/识别到的信息持久化到数据库。
+		if creds := tokenCredentialMap(seed); len(creds) > 0 {
 			if err := h.db.UpdateCredentials(ctx, id, creds); err != nil {
 				log.Printf("AT 账号 %d 更新 credentials 失败: %v", id, err)
 			}
@@ -3242,6 +3227,7 @@ type recycleBinAccountResponse struct {
 	Email              string   `json:"email"`
 	PlanType           string   `json:"plan_type"`
 	ATOnly             bool     `json:"at_only"`
+	AccessTokenType    string   `json:"access_token_type,omitempty"`
 	OpenAIResponsesAPI bool     `json:"openai_responses_api"`
 	BaseURL            string   `json:"base_url,omitempty"`
 	Models             []string `json:"models,omitempty"`
@@ -3281,6 +3267,7 @@ func (h *Handler) ListRecycleBinAccounts(c *gin.Context) {
 			Email:              email,
 			PlanType:           planType,
 			ATOnly:             !isOpenAIResponsesAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
+			AccessTokenType:    accountAccessTokenType(row),
 			OpenAIResponsesAPI: isOpenAIResponsesAccount,
 			BaseURL:            baseURL,
 			Models:             row.GetCredentialStringSlice("models"),

@@ -302,6 +302,11 @@ func ApplyWhamUsage(store *auth.Store, account *auth.Account, usage *WhamUsage) 
 		store.UpdateAccountPlanType(account, usage.PlanType)
 	}
 	if store != nil {
+		accountID := strings.TrimSpace(usage.AccountID)
+		if accountID == "" {
+			accountID = strings.TrimSpace(usage.UserID)
+		}
+		store.UpdateAccountIdentity(account, usage.Email, accountID)
 		store.UpdateAccountSubscriptionExpiresAt(account, usage.SubscriptionExpiresAt())
 	}
 
