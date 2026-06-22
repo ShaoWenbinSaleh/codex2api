@@ -21,6 +21,8 @@ import (
 )
 
 const tinyPNGBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+const tinyWidePNGBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAAE0lEQVR4nGJJSWEwYmAABAAA//8FBQD/YuEhXAAAAABJRU5ErkJggg=="
+const tinyTallPNGBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAACCAIAAAAW4yFwAAAAFElEQVR4nGJKSWFgYjBiAAQAAP//BZgA/3l8/pIAAAAASUVORK5CYII="
 
 func TestBuildImagesAPIResponseCloudURL(t *testing.T) {
 	// 用本地 httptest 充当 S3 端点：PUT 返回 200 让上传成功；
@@ -149,6 +151,23 @@ func tinyPNGByteSize(t *testing.T) int {
 		t.Fatalf("decode tiny png fixture: %v", err)
 	}
 	return len(data)
+}
+
+func tinyImageByteSize(t *testing.T, raw string) int {
+	t.Helper()
+	data, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		t.Fatalf("decode tiny image fixture: %v", err)
+	}
+	return len(data)
+}
+
+func sseDataEvent(payload string) string {
+	return "data: " + payload + "\n\n"
+}
+
+func imageOutputItemDoneEvent(outputIndex int, b64 string) string {
+	return sseDataEvent(fmt.Sprintf(`{"type":"response.output_item.done","output_index":%d,"item":{"type":"image_generation_call","result":"%s","output_format":"png"}}`, outputIndex, b64))
 }
 
 func TestBuildImagesResponsesRequestMatchesReferenceChain(t *testing.T) {
@@ -562,6 +581,83 @@ func TestCollectImagesResponseUsesUpstreamFailureMessage(t *testing.T) {
 	}
 }
 
+func TestCollectImagesResponsePrefersLatestOutputItemForSameOutputIndex(t *testing.T) {
+	upstream := imageOutputItemDoneEvent(0, tinyPNGBase64) +
+		imageOutputItemDoneEvent(0, tinyWidePNGBase64) +
+		sseDataEvent(`{"type":"response.completed","response":{"created_at":1710000000,"tool_usage":{"image_gen":{"images":1}},"tools":[{"type":"image_generation","model":"gpt-image-2","output_format":"png","size":"1536x1024"}],"output":[]}}`)
+
+	out, _, imageCount, imageLogInfo, err := collectImagesResponse(context.Background(), strings.NewReader(upstream), "b64_json", "gpt-image-2", nil)
+	if err != nil {
+		t.Fatalf("collectImagesResponse returned error: %v", err)
+	}
+	if imageCount != 1 {
+		t.Fatalf("imageCount = %d, want 1", imageCount)
+	}
+	if got := gjson.GetBytes(out, "data.0.b64_json").String(); got != tinyWidePNGBase64 {
+		t.Fatalf("b64_json = %q, want latest 2x1 image", got)
+	}
+	if got := gjson.GetBytes(out, "data.0.width").Int(); got != 2 {
+		t.Fatalf("width = %d, want 2", got)
+	}
+	if got := gjson.GetBytes(out, "data.0.height").Int(); got != 1 {
+		t.Fatalf("height = %d, want 1", got)
+	}
+	if got := gjson.GetBytes(out, "data.0.bytes").Int(); got != int64(tinyImageByteSize(t, tinyWidePNGBase64)) {
+		t.Fatalf("bytes = %d, want %d", got, tinyImageByteSize(t, tinyWidePNGBase64))
+	}
+	if imageLogInfo.Width != 2 || imageLogInfo.Height != 1 {
+		t.Fatalf("imageLogInfo = %#v, want 2x1", imageLogInfo)
+	}
+}
+
+func TestCollectImagesResponseOrdersCollectedItemsByOutputIndex(t *testing.T) {
+	upstream := imageOutputItemDoneEvent(2, tinyTallPNGBase64) +
+		imageOutputItemDoneEvent(0, tinyWidePNGBase64) +
+		sseDataEvent(`{"type":"response.completed","response":{"created_at":1710000001,"tool_usage":{"image_gen":{"images":2}},"tools":[{"type":"image_generation","model":"gpt-image-2","output_format":"png","size":"1536x1024"}],"output":[]}}`)
+
+	out, _, imageCount, _, err := collectImagesResponse(context.Background(), strings.NewReader(upstream), "b64_json", "gpt-image-2", nil)
+	if err != nil {
+		t.Fatalf("collectImagesResponse returned error: %v", err)
+	}
+	if imageCount != 2 {
+		t.Fatalf("imageCount = %d, want 2", imageCount)
+	}
+	if got := gjson.GetBytes(out, "data.0.b64_json").String(); got != tinyWidePNGBase64 {
+		t.Fatalf("first b64_json = %q, want output_index 0 image", got)
+	}
+	if got := gjson.GetBytes(out, "data.1.b64_json").String(); got != tinyTallPNGBase64 {
+		t.Fatalf("second b64_json = %q, want output_index 2 image", got)
+	}
+	if got := gjson.GetBytes(out, "data.0.width").Int(); got != 2 {
+		t.Fatalf("first width = %d, want 2", got)
+	}
+	if got := gjson.GetBytes(out, "data.1.height").Int(); got != 2 {
+		t.Fatalf("second height = %d, want 2", got)
+	}
+}
+
+func TestCollectImagesResponsePrefersCompletedOutputOverCollectedItems(t *testing.T) {
+	upstream := imageOutputItemDoneEvent(0, tinyPNGBase64) +
+		sseDataEvent(`{"type":"response.completed","response":{"created_at":1710000002,"tool_usage":{"image_gen":{"images":1}},"tools":[{"type":"image_generation","model":"gpt-image-2","output_format":"png","size":"1536x1024"}],"output":[{"type":"image_generation_call","result":"`+tinyWidePNGBase64+`","output_format":"png"}]}}`)
+
+	out, _, imageCount, imageLogInfo, err := collectImagesResponse(context.Background(), strings.NewReader(upstream), "b64_json", "gpt-image-2", nil)
+	if err != nil {
+		t.Fatalf("collectImagesResponse returned error: %v", err)
+	}
+	if imageCount != 1 {
+		t.Fatalf("imageCount = %d, want 1", imageCount)
+	}
+	if got := gjson.GetBytes(out, "data.0.b64_json").String(); got != tinyWidePNGBase64 {
+		t.Fatalf("b64_json = %q, want completed-output image", got)
+	}
+	if got := gjson.GetBytes(out, "data.0.width").Int(); got != 2 {
+		t.Fatalf("width = %d, want 2", got)
+	}
+	if imageLogInfo.Width != 2 || imageLogInfo.Height != 1 {
+		t.Fatalf("imageLogInfo = %#v, want completed 2x1 image", imageLogInfo)
+	}
+}
+
 func TestBuildImageErrorUsageLogRecordsFailure(t *testing.T) {
 	account := &auth.Account{DBID: 42, AccessToken: "token", PlanType: "plus"}
 	readErr := fmt.Errorf("upstream image generation failed: server_error")
@@ -657,6 +753,42 @@ func TestStreamImagesResponseSendsConnectedComment(t *testing.T) {
 	}
 	if !strings.Contains(body, "event: image_generation.completed\n") {
 		t.Fatalf("stream body missing completed event: %q", body)
+	}
+}
+
+func TestStreamImagesResponseReconstructsFinalImageFromCollectedOutputItems(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upstream := imageOutputItemDoneEvent(0, tinyPNGBase64) +
+		imageOutputItemDoneEvent(0, tinyWidePNGBase64) +
+		sseDataEvent(`{"type":"response.completed","response":{"created_at":1710000003,"tool_usage":{"image_gen":{"images":1}},"tools":[{"type":"image_generation","model":"gpt-image-2","output_format":"png","size":"1536x1024"}],"output":[]}}`)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest("POST", "/v1/images/edits", nil)
+	handler := &Handler{}
+
+	_, imageCount, _, imageLogInfo, err := handler.streamImagesResponse(c, strings.NewReader(upstream), "b64_json", "image_edit", "gpt-image-2", time.Now())
+
+	if err != nil {
+		t.Fatalf("streamImagesResponse returned error: %v", err)
+	}
+	if imageCount != 1 {
+		t.Fatalf("imageCount = %d, want 1", imageCount)
+	}
+	if imageLogInfo.Width != 2 || imageLogInfo.Height != 1 {
+		t.Fatalf("imageLogInfo = %#v, want 2x1", imageLogInfo)
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, "event: image_edit.completed\n") {
+		t.Fatalf("stream body missing image_edit.completed event: %q", body)
+	}
+	if !strings.Contains(body, tinyWidePNGBase64) {
+		t.Fatalf("stream body missing final 2x1 image: %q", body)
+	}
+	if strings.Contains(body, `"width":1`) && !strings.Contains(body, `"width":2`) {
+		t.Fatalf("stream body reported stale square dimensions: %q", body)
+	}
+	if !strings.Contains(body, `"width":2`) || !strings.Contains(body, `"height":1`) {
+		t.Fatalf("stream body missing 2x1 dimensions: %q", body)
 	}
 }
 

@@ -14,6 +14,7 @@ import (
 	"log"
 	"mime/multipart"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1348,13 +1349,14 @@ func shouldRetryImageStreamError(err error, generalRetries *int, maxGeneralRetri
 
 func collectImagesResponse(ctx context.Context, body io.Reader, responseFormat, fallbackModel string, urlFor imageURLBuilder) ([]byte, *UsageInfo, int, imageUsageLogInfo, error) {
 	var (
-		out            []byte
-		usage          *UsageInfo
-		pendingResults []imageCallResult
-		createdAt      int64
-		firstMeta      = imageCallResult{Model: fallbackModel}
-		imageLogInfo   imageUsageLogInfo
-		readErr        error
+		out                 []byte
+		usage               *UsageInfo
+		outputItemsByIndex  = make(map[int64][]byte)
+		outputItemsFallback [][]byte
+		createdAt           int64
+		firstMeta           = imageCallResult{Model: fallbackModel}
+		imageLogInfo        imageUsageLogInfo
+		readErr             error
 	)
 	err := ReadSSEStream(body, func(data []byte) bool {
 		if meta, eventCreatedAt, ok := extractImageMetaFromLifecycleEvent(data); ok {
@@ -1365,12 +1367,9 @@ func collectImagesResponse(ctx context.Context, body io.Reader, responseFormat, 
 		}
 		switch gjson.GetBytes(data, "type").String() {
 		case "response.output_item.done":
-			if image, ok := extractImageFromOutputItemDone(data, fallbackModel); ok {
-				mergeImageMeta(&image, firstMeta)
-				pendingResults = append(pendingResults, image)
-			}
+			collectImageOutputItemDone(data, outputItemsByIndex, &outputItemsFallback)
 		case "response.completed":
-			results, completedAt, usageRaw, completedMeta, completedUsage, err := extractImagesFromResponsesCompleted(data, fallbackModel)
+			results, completedAt, usageRaw, completedMeta, completedUsage, err := extractImagesFromResponsesCompleted(data, outputItemsByIndex, outputItemsFallback, fallbackModel)
 			if err != nil {
 				readErr = err
 				return false
@@ -1381,12 +1380,6 @@ func collectImagesResponse(ctx context.Context, body io.Reader, responseFormat, 
 			mergeImageMeta(&firstMeta, completedMeta)
 			if completedUsage != nil {
 				usage = completedUsage
-			}
-			if len(results) == 0 {
-				results = pendingResults
-				if len(results) > 0 {
-					firstMeta = results[0]
-				}
 			}
 			if len(results) == 0 {
 				readErr = fmt.Errorf("upstream did not return image output")
@@ -1411,15 +1404,17 @@ func collectImagesResponse(ctx context.Context, body io.Reader, responseFormat, 
 		return nil, usage, 0, imageLogInfo, readErr
 	}
 	if len(out) == 0 {
-		if len(pendingResults) > 0 {
-			for i := range pendingResults {
-				mergeImageMeta(&pendingResults[i], firstMeta)
+		results, fallbackMeta := extractImagesFromCollectedOutputItems(outputItemsByIndex, outputItemsFallback, fallbackModel)
+		if len(results) > 0 {
+			mergeImageMeta(&fallbackMeta, firstMeta)
+			for i := range results {
+				mergeImageMeta(&results[i], firstMeta)
 			}
-			out, readErr = buildImagesAPIResponse(ctx, pendingResults, createdAt, nil, firstMeta, responseFormat, urlFor)
+			out, readErr = buildImagesAPIResponse(ctx, results, createdAt, nil, fallbackMeta, responseFormat, urlFor)
 			if readErr != nil {
 				return nil, usage, 0, imageLogInfo, readErr
 			}
-			imageLogInfo = imageUsageLogInfoFromImages(pendingResults)
+			imageLogInfo = imageUsageLogInfoFromImages(results)
 			return out, usage, len(gjson.GetBytes(out, "data").Array()), imageLogInfo, nil
 		}
 		return nil, usage, 0, imageLogInfo, fmt.Errorf("stream disconnected before image generation completed")
@@ -1439,14 +1434,15 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 	}
 
 	var (
-		usage          *UsageInfo
-		firstTokenMs   int
-		createdAt      int64
-		streamMeta     = imageCallResult{Model: fallbackModel}
-		pendingResults []imageCallResult
-		imageCount     int
-		imageLogInfo   imageUsageLogInfo
-		readErr        error
+		usage               *UsageInfo
+		firstTokenMs        int
+		createdAt           int64
+		streamMeta          = imageCallResult{Model: fallbackModel}
+		outputItemsByIndex  = make(map[int64][]byte)
+		outputItemsFallback [][]byte
+		imageCount          int
+		imageLogInfo        imageUsageLogInfo
+		readErr             error
 	)
 	streamWriter := newStreamFlushWriter(c.Writer, flusher)
 	var (
@@ -1541,12 +1537,9 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 			eventName := streamPrefix + ".partial_image"
 			writeEvent(eventName, buildImagesStreamPartialPayload(eventName, b64, gjson.GetBytes(data, "partial_image_index").Int(), responseFormat, createdAt, partialMeta))
 		case "response.output_item.done":
-			if image, ok := extractImageFromOutputItemDone(data, fallbackModel); ok {
-				mergeImageMeta(&image, streamMeta)
-				pendingResults = append(pendingResults, image)
-			}
+			collectImageOutputItemDone(data, outputItemsByIndex, &outputItemsFallback)
 		case "response.completed":
-			results, completedAt, usageRaw, firstMeta, completedUsage, err := extractImagesFromResponsesCompleted(data, fallbackModel)
+			results, completedAt, usageRaw, firstMeta, completedUsage, err := extractImagesFromResponsesCompleted(data, outputItemsByIndex, outputItemsFallback, fallbackModel)
 			if err != nil {
 				writeEvent("error", buildImagesStreamErrorPayload(err.Error()))
 				setReadErr(err)
@@ -1559,9 +1552,6 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 				createdAt = completedAt
 			}
 			mergeImageMeta(&streamMeta, firstMeta)
-			if len(results) == 0 {
-				results = pendingResults
-			}
 			if len(results) == 0 {
 				err := fmt.Errorf("upstream did not return image output")
 				writeEvent("error", buildImagesStreamErrorPayload(err.Error()))
@@ -1599,13 +1589,16 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 	if getReadErr() == nil {
 		_ = writeRaw("", true)
 	}
-	if imageCount == 0 && len(pendingResults) > 0 && getReadErr() == nil {
-		eventName := streamPrefix + ".completed"
-		for _, image := range pendingResults {
-			mergeImageMeta(&image, streamMeta)
-			writeEvent(eventName, buildImagesStreamCompletedPayload(eventName, image, responseFormat, createdAt, nil))
-			imageLogInfo = mergeImageUsageLogInfo(imageLogInfo, imageUsageLogInfoFromImage(image))
-			imageCount++
+	if imageCount == 0 && getReadErr() == nil {
+		results, _ := extractImagesFromCollectedOutputItems(outputItemsByIndex, outputItemsFallback, fallbackModel)
+		if len(results) > 0 {
+			eventName := streamPrefix + ".completed"
+			for _, image := range results {
+				mergeImageMeta(&image, streamMeta)
+				writeEvent(eventName, buildImagesStreamCompletedPayload(eventName, image, responseFormat, createdAt, nil))
+				imageLogInfo = mergeImageUsageLogInfo(imageLogInfo, imageUsageLogInfoFromImage(image))
+				imageCount++
+			}
 		}
 	}
 	if imageCount == 0 && getReadErr() == nil {
@@ -1614,6 +1607,134 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 		setReadErr(err)
 	}
 	return usage, imageCount, firstTokenMs, imageLogInfo, getReadErr()
+}
+
+func collectImageOutputItemDone(payload []byte, outputItemsByIndex map[int64][]byte, outputItemsFallback *[][]byte) {
+	item := gjson.GetBytes(payload, "item")
+	if !item.Exists() || item.Type != gjson.JSON {
+		return
+	}
+	outputIndex := gjson.GetBytes(payload, "output_index")
+	if outputIndex.Exists() {
+		if outputItemsByIndex != nil {
+			outputItemsByIndex[outputIndex.Int()] = []byte(item.Raw)
+		}
+		return
+	}
+	if outputItemsFallback != nil {
+		*outputItemsFallback = append(*outputItemsFallback, []byte(item.Raw))
+	}
+}
+
+func extractImagesFromCollectedOutputItems(outputItemsByIndex map[int64][]byte, outputItemsFallback [][]byte, fallbackModel string) ([]imageCallResult, imageCallResult) {
+	results := make([]imageCallResult, 0, len(outputItemsByIndex)+len(outputItemsFallback))
+	firstMeta := imageCallResult{Model: fallbackModel}
+	appendItem := func(raw []byte) {
+		if len(raw) == 0 {
+			return
+		}
+		image, ok := extractImageFromOutputItem(gjson.ParseBytes(raw), fallbackModel)
+		if !ok {
+			return
+		}
+		if len(results) == 0 {
+			firstMeta = image
+		}
+		results = append(results, image)
+	}
+
+	if len(outputItemsByIndex) > 0 {
+		indexes := make([]int64, 0, len(outputItemsByIndex))
+		for idx := range outputItemsByIndex {
+			indexes = append(indexes, idx)
+		}
+		sort.Slice(indexes, func(i, j int) bool { return indexes[i] < indexes[j] })
+		for _, idx := range indexes {
+			appendItem(outputItemsByIndex[idx])
+		}
+	}
+	for _, raw := range outputItemsFallback {
+		appendItem(raw)
+	}
+	return results, firstMeta
+}
+
+func extractImagesFromResponsesCompleted(payload []byte, outputItemsByIndex map[int64][]byte, outputItemsFallback [][]byte, fallbackModel string) ([]imageCallResult, int64, []byte, imageCallResult, *UsageInfo, error) {
+	if gjson.GetBytes(payload, "type").String() != "response.completed" {
+		return nil, 0, nil, imageCallResult{}, nil, fmt.Errorf("unexpected event type")
+	}
+
+	createdAt := gjson.GetBytes(payload, "response.created_at").Int()
+	if createdAt <= 0 {
+		createdAt = time.Now().Unix()
+	}
+
+	firstMeta := imageCallResult{Model: fallbackModel}
+	if meta, _, ok := extractImageMetaFromLifecycleEvent(payload); ok {
+		mergeImageMeta(&firstMeta, meta)
+	}
+
+	results := make([]imageCallResult, 0)
+	if output := gjson.GetBytes(payload, "response.output"); output.Exists() && output.IsArray() && len(output.Array()) > 0 {
+		results = make([]imageCallResult, 0, len(output.Array()))
+		for _, item := range output.Array() {
+			image, ok := extractImageFromOutputItem(item, fallbackModel)
+			if !ok {
+				continue
+			}
+			mergeImageMeta(&image, firstMeta)
+			if len(results) == 0 {
+				firstMeta = image
+			}
+			results = append(results, image)
+		}
+	} else {
+		var collectedMeta imageCallResult
+		results, collectedMeta = extractImagesFromCollectedOutputItems(outputItemsByIndex, outputItemsFallback, fallbackModel)
+		if len(results) > 0 {
+			mergeImageMeta(&collectedMeta, firstMeta)
+			firstMeta = collectedMeta
+			for i := range results {
+				mergeImageMeta(&results[i], firstMeta)
+			}
+		}
+	}
+
+	var usageRaw []byte
+	if usage := gjson.GetBytes(payload, "response.tool_usage.image_gen"); usage.Exists() && usage.IsObject() {
+		usageRaw = []byte(usage.Raw)
+	}
+	usage := extractUsageFromResult(gjson.GetBytes(payload, "response.usage"))
+	if len(usageRaw) > 0 {
+		if imageUsage := extractUsageFromResult(gjson.ParseBytes(usageRaw)); hasTokenUsage(imageUsage) {
+			usage = imageUsage
+		}
+	}
+	return results, createdAt, usageRaw, firstMeta, usage, nil
+}
+
+func extractImageFromOutputItem(item gjson.Result, fallbackModel string) (imageCallResult, bool) {
+	if !item.Exists() || item.Get("type").String() != "image_generation_call" {
+		return imageCallResult{}, false
+	}
+	result := strings.TrimSpace(item.Get("result").String())
+	if result == "" {
+		return imageCallResult{}, false
+	}
+	image := imageCallResult{
+		Result:        result,
+		RevisedPrompt: strings.TrimSpace(item.Get("revised_prompt").String()),
+		OutputFormat:  strings.TrimSpace(item.Get("output_format").String()),
+		Size:          strings.TrimSpace(item.Get("size").String()),
+		ByteSize:      int(item.Get("bytes").Int()),
+		Width:         int(item.Get("width").Int()),
+		Height:        int(item.Get("height").Int()),
+		Background:    strings.TrimSpace(item.Get("background").String()),
+		Quality:       strings.TrimSpace(item.Get("quality").String()),
+		Model:         fallbackModel,
+	}
+	populateImageStats(&image)
+	return image, true
 }
 
 func startImageStreamKeepalive(ctx context.Context, interval time.Duration, writeKeepalive func() bool) func() {
@@ -1678,64 +1799,6 @@ func firstNonEmptyImageErrorField(values ...string) string {
 	return ""
 }
 
-func extractImagesFromResponsesCompleted(payload []byte, fallbackModel string) ([]imageCallResult, int64, []byte, imageCallResult, *UsageInfo, error) {
-	if gjson.GetBytes(payload, "type").String() != "response.completed" {
-		return nil, 0, nil, imageCallResult{}, nil, fmt.Errorf("unexpected event type")
-	}
-
-	createdAt := gjson.GetBytes(payload, "response.created_at").Int()
-	if createdAt <= 0 {
-		createdAt = time.Now().Unix()
-	}
-
-	results := make([]imageCallResult, 0)
-	firstMeta := imageCallResult{Model: fallbackModel}
-	if meta, _, ok := extractImageMetaFromLifecycleEvent(payload); ok {
-		mergeImageMeta(&firstMeta, meta)
-	}
-	if output := gjson.GetBytes(payload, "response.output"); output.IsArray() {
-		for _, item := range output.Array() {
-			if item.Get("type").String() != "image_generation_call" {
-				continue
-			}
-			result := strings.TrimSpace(item.Get("result").String())
-			if result == "" {
-				continue
-			}
-			image := imageCallResult{
-				Result:        result,
-				RevisedPrompt: strings.TrimSpace(item.Get("revised_prompt").String()),
-				OutputFormat:  strings.TrimSpace(item.Get("output_format").String()),
-				Size:          strings.TrimSpace(item.Get("size").String()),
-				ByteSize:      int(item.Get("bytes").Int()),
-				Width:         int(item.Get("width").Int()),
-				Height:        int(item.Get("height").Int()),
-				Background:    strings.TrimSpace(item.Get("background").String()),
-				Quality:       strings.TrimSpace(item.Get("quality").String()),
-				Model:         fallbackModel,
-			}
-			populateImageStats(&image)
-			mergeImageMeta(&image, firstMeta)
-			if len(results) == 0 {
-				firstMeta = image
-			}
-			results = append(results, image)
-		}
-	}
-
-	var usageRaw []byte
-	if usage := gjson.GetBytes(payload, "response.tool_usage.image_gen"); usage.Exists() && usage.IsObject() {
-		usageRaw = []byte(usage.Raw)
-	}
-	usage := extractUsageFromResult(gjson.GetBytes(payload, "response.usage"))
-	if len(usageRaw) > 0 {
-		if imageUsage := extractUsageFromResult(gjson.ParseBytes(usageRaw)); hasTokenUsage(imageUsage) {
-			usage = imageUsage
-		}
-	}
-	return results, createdAt, usageRaw, firstMeta, usage, nil
-}
-
 func hasTokenUsage(usage *UsageInfo) bool {
 	return usage != nil && (usage.InputTokens > 0 || usage.OutputTokens > 0 || usage.TotalTokens > 0)
 }
@@ -1744,28 +1807,7 @@ func extractImageFromOutputItemDone(payload []byte, fallbackModel string) (image
 	if gjson.GetBytes(payload, "type").String() != "response.output_item.done" {
 		return imageCallResult{}, false
 	}
-	item := gjson.GetBytes(payload, "item")
-	if !item.Exists() || item.Get("type").String() != "image_generation_call" {
-		return imageCallResult{}, false
-	}
-	result := strings.TrimSpace(item.Get("result").String())
-	if result == "" {
-		return imageCallResult{}, false
-	}
-	image := imageCallResult{
-		Result:        result,
-		RevisedPrompt: strings.TrimSpace(item.Get("revised_prompt").String()),
-		OutputFormat:  strings.TrimSpace(item.Get("output_format").String()),
-		Size:          strings.TrimSpace(item.Get("size").String()),
-		ByteSize:      int(item.Get("bytes").Int()),
-		Width:         int(item.Get("width").Int()),
-		Height:        int(item.Get("height").Int()),
-		Background:    strings.TrimSpace(item.Get("background").String()),
-		Quality:       strings.TrimSpace(item.Get("quality").String()),
-		Model:         fallbackModel,
-	}
-	populateImageStats(&image)
-	return image, true
+	return extractImageFromOutputItem(gjson.GetBytes(payload, "item"), fallbackModel)
 }
 
 func extractImageMetaFromLifecycleEvent(payload []byte) (imageCallResult, int64, bool) {
