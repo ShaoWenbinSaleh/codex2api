@@ -65,6 +65,8 @@ const (
 
 var imageStreamKeepaliveInterval = 15 * time.Second
 
+var executeImagesUpstreamRequest = ExecuteRequest
+
 type imageCallResult struct {
 	Result        string
 	RevisedPrompt string
@@ -890,14 +892,14 @@ func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
 	if releaseAPIKeyConcurrency != nil {
 		defer releaseAPIKeyConcurrency()
 	}
-	tool := buildImagesEditToolFromForm(c, imageModel, maskDataURL)
+	tool := buildImagesEditToolFromForm(c, imageModel, promptForRequest, maskDataURL)
 	responsesBody := buildImagesResponsesRequest(promptForRequest, images, tool)
 	h.forwardImagesRequest(c, "/v1/images/edits", imageModel, requestModel, logEffectiveModel, responsesBody, responseFormat, "image_edit", stream)
 }
 
-func buildImagesEditToolFromForm(c *gin.Context, imageModel, maskDataURL string) []byte {
+func buildImagesEditToolFromForm(c *gin.Context, imageModel, promptForRequest, maskDataURL string) []byte {
 	tool := []byte(`{"type":"image_generation","action":"edit","model":""}`)
-	toolModel, defaultSize := normalizeImageToolModelForPrompt(imageModel, strings.TrimSpace(c.PostForm("prompt")))
+	toolModel, defaultSize := normalizeImageToolModelForPrompt(imageModel, promptForRequest)
 	tool, _ = sjson.SetBytes(tool, "model", toolModel)
 	for _, field := range []string{"size", "quality", "background", "output_format", "input_fidelity", "moderation"} {
 		if value := strings.TrimSpace(c.PostForm(field)); value != "" {
@@ -911,6 +913,27 @@ func buildImagesEditToolFromForm(c *gin.Context, imageModel, maskDataURL string)
 	}
 	if strings.TrimSpace(maskDataURL) != "" {
 		tool, _ = sjson.SetBytes(tool, "input_image_mask.image_url", strings.TrimSpace(maskDataURL))
+	}
+	tool = setDefaultImageToolSize(tool, defaultSize)
+	return tool
+}
+
+func buildImagesEditToolFromJSONBody(rawBody []byte, imageModel, promptForRequest, maskDataURL string) []byte {
+	tool := []byte(`{"type":"image_generation","action":"edit","model":""}`)
+	toolModel, defaultSize := normalizeImageToolModelForPrompt(imageModel, promptForRequest)
+	tool, _ = sjson.SetBytes(tool, "model", toolModel)
+	for _, field := range []string{"size", "quality", "background", "output_format", "input_fidelity", "moderation"} {
+		if value := strings.TrimSpace(gjson.GetBytes(rawBody, field).String()); value != "" {
+			tool, _ = sjson.SetBytes(tool, field, value)
+		}
+	}
+	for _, field := range []string{"output_compression", "partial_images"} {
+		if value := gjson.GetBytes(rawBody, field); value.Exists() && value.Type == gjson.Number {
+			tool, _ = sjson.SetBytes(tool, field, value.Int())
+		}
+	}
+	if maskDataURL != "" {
+		tool, _ = sjson.SetBytes(tool, "input_image_mask.image_url", maskDataURL)
 	}
 	tool = setDefaultImageToolSize(tool, defaultSize)
 	return tool
@@ -1002,23 +1025,7 @@ func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
 	if releaseAPIKeyConcurrency != nil {
 		defer releaseAPIKeyConcurrency()
 	}
-	tool := []byte(`{"type":"image_generation","action":"edit","model":""}`)
-	toolModel, defaultSize := normalizeImageToolModelForPrompt(imageModel, promptForRequest)
-	tool, _ = sjson.SetBytes(tool, "model", toolModel)
-	for _, field := range []string{"size", "quality", "background", "output_format", "input_fidelity", "moderation"} {
-		if value := strings.TrimSpace(gjson.GetBytes(rawBody, field).String()); value != "" {
-			tool, _ = sjson.SetBytes(tool, field, value)
-		}
-	}
-	for _, field := range []string{"output_compression", "partial_images"} {
-		if value := gjson.GetBytes(rawBody, field); value.Exists() && value.Type == gjson.Number {
-			tool, _ = sjson.SetBytes(tool, field, value.Int())
-		}
-	}
-	if maskDataURL != "" {
-		tool, _ = sjson.SetBytes(tool, "input_image_mask.image_url", maskDataURL)
-	}
-	tool = setDefaultImageToolSize(tool, defaultSize)
+	tool := buildImagesEditToolFromJSONBody(rawBody, imageModel, promptForRequest, maskDataURL)
 
 	responsesBody := buildImagesResponsesRequest(promptForRequest, images, tool)
 	h.forwardImagesRequest(c, "/v1/images/edits", imageModel, requestModel, logEffectiveModel, responsesBody, responseFormat, "image_edit", stream)
@@ -1116,7 +1123,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			deviceCfg = &DeviceProfileConfig{StabilizeDeviceProfile: false}
 		}
 
-		resp, reqErr := ExecuteRequest(c.Request.Context(), account, responsesBody, "", proxyURL, apiKey, deviceCfg, c.Request.Header.Clone(), false)
+		resp, reqErr := executeImagesUpstreamRequest(c.Request.Context(), account, responsesBody, "", proxyURL, apiKey, deviceCfg, c.Request.Header.Clone(), false)
 		durationMs := int(time.Since(start).Milliseconds())
 		if reqErr != nil {
 			if kind := classifyTransportFailure(reqErr); kind != "" {

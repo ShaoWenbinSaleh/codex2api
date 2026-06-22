@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -498,6 +499,21 @@ func TestBuildImagesResponsesRequestIncludesEditImages(t *testing.T) {
 	}
 }
 
+func TestBuildImagesEditToolFromJSONBodyPreservesExplicitSize(t *testing.T) {
+	raw := []byte(`{
+		"prompt":"replace background",
+		"size":"1536x1024",
+		"output_format":"png"
+	}`)
+	tool := buildImagesEditToolFromJSONBody(raw, "gpt-image-2", "replace background", "")
+	if got := gjson.GetBytes(tool, "action").String(); got != "edit" {
+		t.Fatalf("action = %q, want edit", got)
+	}
+	if got := gjson.GetBytes(tool, "size").String(); got != "1536x1024" {
+		t.Fatalf("size = %q, want explicit size", got)
+	}
+}
+
 func TestCollectImagesResponseBuildsOpenAIImagePayload(t *testing.T) {
 	upstream := `data: {"type":"response.completed","response":{"created_at":1710000000,"usage":{"input_tokens":5,"output_tokens":9},"tool_usage":{"image_gen":{"images":1,"input_tokens":34,"output_tokens":1756}},"tools":[{"type":"image_generation","model":"gpt-image-2","output_format":"png","quality":"high","size":"1024x1024"}],"output":[{"type":"image_generation_call","result":"` + tinyPNGBase64 + `","revised_prompt":"draw a cat","output_format":"png"}]}}` + "\n\n"
 
@@ -641,5 +657,53 @@ func TestStreamImagesResponseSendsConnectedComment(t *testing.T) {
 	}
 	if !strings.Contains(body, "event: image_generation.completed\n") {
 		t.Fatalf("stream body missing completed event: %q", body)
+	}
+}
+
+func TestImagesEditsForwardsExplicitSizeToUpstream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "token", PlanType: "plus"})
+	handler := &Handler{store: store}
+
+	originalExec := executeImagesUpstreamRequest
+	t.Cleanup(func() {
+		executeImagesUpstreamRequest = originalExec
+	})
+
+	var seenBody []byte
+	executeImagesUpstreamRequest = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, useWebsocket ...bool) (*http.Response, error) {
+		seenBody = append([]byte(nil), requestBody...)
+		upstream := `data: {"type":"response.completed","response":{"created_at":1710000000,"tool_usage":{"image_gen":{"images":1}},"tools":[{"type":"image_generation","model":"gpt-image-2","output_format":"png","size":"1536x1024"}],"output":[{"type":"image_generation_call","result":"` + tinyPNGBase64 + `","output_format":"png"}]}}` + "\n\n"
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(upstream)),
+		}, nil
+	}
+
+	body := `{
+		"model":"gpt-image-2",
+		"prompt":"Replace the background with aurora lights",
+		"images":[{"image_url":"https://example.com/source.png"}],
+		"size":"1536x1024",
+		"output_format":"png"
+	}`
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("Authorization", "Bearer sk-test")
+
+	handler.ImagesEdits(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := gjson.GetBytes(seenBody, "tools.0.action").String(); got != "edit" {
+		t.Fatalf("tools.0.action = %q, want edit; body=%s", got, seenBody)
+	}
+	if got := gjson.GetBytes(seenBody, "tools.0.size").String(); got != "1536x1024" {
+		t.Fatalf("tools.0.size = %q, want 1536x1024; body=%s", got, seenBody)
 	}
 }
