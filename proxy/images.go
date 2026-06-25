@@ -314,6 +314,26 @@ func AppendImageStyleToPrompt(prompt string, style string) string {
 	return prompt + "\n\nStyle guidance: " + style
 }
 
+func appendImageEditSizeConstraintToPrompt(prompt string, size string) string {
+	prompt = strings.TrimSpace(prompt)
+	size = strings.TrimSpace(size)
+	if prompt == "" || size == "" || strings.EqualFold(size, "auto") {
+		return prompt
+	}
+	if err := validateGPTImage2Size(size); err != nil {
+		return prompt
+	}
+	parts := strings.Split(strings.ToLower(size), "x")
+	if len(parts) != 2 {
+		return prompt
+	}
+	width, height := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+	if width == "" || height == "" {
+		return prompt
+	}
+	return prompt + fmt.Sprintf("\n\nOutput size requirement: The final image canvas must be exactly width %s pixels and height %s pixels.", width, height)
+}
+
 func imageUsageLogInfoFromResponseJSON(responseJSON []byte) imageUsageLogInfo {
 	var info imageUsageLogInfo
 	output := gjson.GetBytes(responseJSON, "output")
@@ -880,6 +900,7 @@ func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
 
 	style := strings.TrimSpace(c.PostForm("style"))
 	promptForRequest := AppendImageStyleToPrompt(prompt, style)
+	promptForRequest = appendImageEditSizeConstraintToPrompt(promptForRequest, c.PostForm("size"))
 	if h.inspectPromptFilterTextOpenAI(c, promptForRequest, "/v1/images/edits", imageModel) {
 		return
 	}
@@ -1013,6 +1034,7 @@ func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
 
 	style := strings.TrimSpace(gjson.GetBytes(rawBody, "style").String())
 	promptForRequest := AppendImageStyleToPrompt(prompt, style)
+	promptForRequest = appendImageEditSizeConstraintToPrompt(promptForRequest, gjson.GetBytes(rawBody, "size").String())
 	if h.inspectPromptFilterTextOpenAI(c, promptForRequest, "/v1/images/edits", imageModel) {
 		return
 	}

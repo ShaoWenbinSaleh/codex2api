@@ -369,6 +369,33 @@ func TestAppendImageStyleToPrompt(t *testing.T) {
 	}
 }
 
+func TestAppendImageEditSizeConstraintToPrompt(t *testing.T) {
+	tests := []struct {
+		size string
+		want string
+	}{
+		{size: "1024x1536", want: "width 1024 pixels and height 1536 pixels"},
+		{size: "1536x1024", want: "width 1536 pixels and height 1024 pixels"},
+		{size: "2048x1152", want: "width 2048 pixels and height 1152 pixels"},
+	}
+	for _, test := range tests {
+		got := appendImageEditSizeConstraintToPrompt("replace background", test.size)
+		if !strings.Contains(got, "replace background") {
+			t.Fatalf("prompt missing original text for %s: %q", test.size, got)
+		}
+		if !strings.Contains(got, test.want) {
+			t.Fatalf("prompt missing size constraint for %s: %q", test.size, got)
+		}
+	}
+
+	if got := appendImageEditSizeConstraintToPrompt("replace background", "auto"); got != "replace background" {
+		t.Fatalf("auto size should leave prompt unchanged, got %q", got)
+	}
+	if got := appendImageEditSizeConstraintToPrompt("replace background", "1024*1536"); got != "replace background" {
+		t.Fatalf("invalid size should leave prompt unchanged, got %q", got)
+	}
+}
+
 func TestNormalizeImageToolModelAliases(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -837,5 +864,8 @@ func TestImagesEditsForwardsExplicitSizeToUpstream(t *testing.T) {
 	}
 	if got := gjson.GetBytes(seenBody, "tools.0.size").String(); got != "1536x1024" {
 		t.Fatalf("tools.0.size = %q, want 1536x1024; body=%s", got, seenBody)
+	}
+	if got := gjson.GetBytes(seenBody, "input.0.content.0.text").String(); !strings.Contains(got, "width 1536 pixels and height 1024 pixels") {
+		t.Fatalf("input prompt missing size constraint: %q; body=%s", got, seenBody)
 	}
 }
